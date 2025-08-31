@@ -65,6 +65,9 @@ from kag.builder.component.vectorizer.batch_vectorizer import BatchVectorizer
 from kag.builder.component.writer.kg_writer import KGWriter
 from kag.builder.component.writer.memory_graph_writer import MemoryGraphWriter
 
+# 导入prompt模块以确保注册机制生效
+from kag.builder.component import prompt
+
 
 __all__ = [
     "DefaultExternalGraphLoader",
