@@ -6,3 +6,4 @@ import kag.common.tools.algorithm_tool.chunk_retriever.outline_chunk_retriever
 import kag.common.tools.algorithm_tool.chunk_retriever.table_retriever
 import kag.common.tools.algorithm_tool.chunk_retriever.summary_chunk_retriever
 import kag.common.tools.algorithm_tool.chunk_retriever.atomic_query_chunk_retriever
+import kag.common.tools.algorithm_tool.chunk_retriever.tunnel_engineering_chunk_retriever

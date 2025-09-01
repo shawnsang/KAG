@@ -194,6 +194,205 @@ AtomicQuery(原子问): IndexType
         ]
 
 
+@KAGIndexManager.register("tunnel_engineering_index")
+class TunnelEngineeringIndexManager(KAGIndexManager):
+    """
+    隧道工程专用索引管理器
+    
+    专为隧道工程领域设计的智能索引管理器，集成了Token感知抽取和检索技术，
+    能够高效处理隧道工程相关的技术文档、规范标准、施工工艺等专业内容。
+    """
+    
+    @property
+    def name(self):
+        return "隧道工程专用索引管理器"
+    
+    @property
+    def description(self) -> str:
+        return """专为隧道工程领域设计的智能索引管理器，采用Token感知技术进行知识抽取和检索。
+        该管理器能够识别和处理隧道工程中的专业术语、技术规范、施工工艺、质量标准等内容，
+        通过智能的Token管理和多模态检索策略，为隧道工程项目提供精准的知识服务。
+        
+        核心特性：
+        1. Token感知的智能抽取：优化处理长文档，避免信息截断
+        2. 领域专业检索：结合语义检索和关键词检索，提升专业内容召回率
+        3. 多层次知识组织：支持结构化和非结构化内容的统一索引
+        4. 性能优化：针对隧道工程文档特点进行检索性能优化
+        """
+    
+    @property
+    def schema(self) -> str:
+        return """
+Chunk(文本块): IndexType
+    properties:
+        content(内容): Text
+            index: TextAndVector
+        source(来源): Text
+            index: Text
+        timestamp(时间戳): Text
+        token_count(Token数量): Text
+        
+TunnelEntity(隧道实体): IndexType
+    properties:
+        name(名称): Text
+            index: TextAndVector
+        type(类型): Text
+            index: Text
+        description(描述): Text
+            index: TextAndVector
+        category(分类): Text
+            index: Text
+    relations:
+        relatedTo(相关): TunnelEntity
+        sourceChunk(来源文本块): Chunk
+        
+TunnelRelation(隧道关系): IndexType
+    properties:
+        relation_type(关系类型): Text
+            index: Text
+        confidence(置信度): Text
+    relations:
+        subject(主体): TunnelEntity
+        object(客体): TunnelEntity
+        sourceChunk(来源文本块): Chunk
+        """
+    
+    @property
+    def index_cost(self) -> str:
+        return """
+        索引构建成本估算：
+        
+        1. 抽取模型消耗：7B模型约150,000 tokens（10万字文档）
+        2. 构建耗时：约180-240秒（包含Token感知处理）
+        3. 存储成本：相比标准索引增加约30%（包含Token统计和元数据）
+        4. 内存占用：峰值约2-3GB（大文档处理时）
+        
+        优化建议：
+        - 对于大型文档集合，建议分批处理
+        - 启用增量索引更新以降低维护成本
+        - 定期清理过期索引以优化存储
+        """
+    
+    @property
+    def applicable_scenarios(self) -> str:
+        return """
+        **适用场景**：
+        1. 隧道工程技术文档问答：施工规范、设计标准、技术指南等
+        2. 工程项目知识管理：项目经验、案例分析、问题解决方案
+        3. 专业培训和学习：工程师培训材料、技术知识库
+        4. 质量控制和安全管理：质量标准、安全规程、检测方法
+        5. 设备和材料查询：设备规格、材料性能、供应商信息
+        
+        **检索流程**：
+        1. `preprocess_query(query)`: 预处理查询，识别专业术语
+        2. `token_aware_extract(content)`: Token感知抽取，优化长文档处理
+        3. `hybrid_retrieve(query)`: 混合检索策略（语义+关键词+实体）
+        4. `rank_and_filter(results)`: 结果排序和过滤，确保相关性
+        
+        **代码示例**：
+        ```python
+        # 基础检索
+        chunks = hybrid_retrieve(preprocess_query(user_query))
+        
+        # 高级检索（包含实体关系）
+        results = {
+            'chunks': hybrid_retrieve(query),
+            'entities': extract_related_entities(query),
+            'relations': find_entity_relations(entities)
+        }
+        ```
+        """
+    
+    @property
+    def retrieval_method(self) -> str:
+        return """采用Token感知的混合检索策略：
+        1. 语义向量检索：基于深度学习模型的语义理解
+        2. 关键词检索：针对隧道工程专业术语优化
+        3. 实体关系检索：基于知识图谱的关联检索
+        4. Token感知过滤：智能管理检索结果的Token使用
+        """
+    
+    @classmethod
+    def build_extractor_config(
+        cls, llm_config: Dict, vectorize_model_config: Dict, **kwargs
+    ):
+        kb_task_project_id = kwargs.get(KAGConstants.KAG_QA_TASK_CONFIG_KEY, None)
+        return [
+            {
+                "type": "tunnel_engineering_extractor",
+                "llm": llm_config,
+                "vectorize_model": vectorize_model_config,
+                "max_tokens_per_chunk": 512,
+                "overlap_tokens": 50,
+                "enable_entity_extraction": True,
+                "enable_relation_extraction": True,
+                "tunnel_domain_keywords": {
+                    "结构": ["隧道", "衬砌", "拱顶", "边墙", "仰拱", "洞门"],
+                    "材料": ["混凝土", "钢筋", "防水板", "土工布", "排水管"],
+                    "工艺": ["开挖", "支护", "衬砌", "防水", "排水", "注浆"],
+                    "质量": ["强度", "厚度", "密实度", "渗透系数"],
+                    "安全": ["监测", "预警", "应急", "防护"]
+                },
+                "performance_monitoring": True,
+                "kag_qa_task_config_key": kb_task_project_id,
+            }
+        ]
+    
+    @classmethod
+    def build_retriever_config(
+        cls, llm_config: Dict, vectorize_model_config: Dict, **kwargs
+    ):
+        kb_task_project_id = kwargs.get(KAGConstants.KAG_QA_TASK_CONFIG_KEY, None)
+        return [
+            {
+                "type": "tunnel_engineering_chunk_retriever",
+                "vectorize_model": vectorize_model_config,
+                "search_api": {
+                    "type": "openspg_search_api",
+                    "kag_qa_task_config_key": kb_task_project_id,
+                },
+                "graph_api": {
+                    "type": "openspg_graph_api",
+                    "kag_qa_task_config_key": kb_task_project_id,
+                },
+                "top_k": 10,
+                "score_threshold": 0.75,
+                "max_tokens_per_chunk": 512,
+                "enable_semantic_search": True,
+                "enable_keyword_search": True,
+                "tunnel_keywords": {
+                    "结构": ["隧道", "衬砌", "拱顶", "边墙", "仰拱", "洞门"],
+                    "材料": ["混凝土", "钢筋", "防水板", "土工布", "排水管"],
+                    "工艺": ["开挖", "支护", "衬砌", "防水", "排水", "注浆"],
+                    "质量": ["强度", "厚度", "密实度", "渗透系数"],
+                    "安全": ["监测", "预警", "应急", "防护"]
+                },
+                "kag_qa_task_config_key": kb_task_project_id,
+            },
+            {
+                "type": "vector_chunk_retriever",
+                "score_threshold": 0.7,
+                "vectorize_model": vectorize_model_config,
+                "search_api": {
+                    "type": "openspg_search_api",
+                    "kag_qa_task_config_key": kb_task_project_id,
+                },
+                "top_k": 5,
+                "kag_qa_task_config_key": kb_task_project_id,
+            },
+            {
+                "type": "text_chunk_retriever",
+                "vectorize_model": vectorize_model_config,
+                "search_api": {
+                    "type": "openspg_search_api",
+                    "kag_qa_task_config_key": kb_task_project_id,
+                },
+                "top_k": 5,
+                "kag_qa_task_config_key": kb_task_project_id,
+            },
+        ]
+
+
 @KAGIndexManager.register("chunk_index")
 class ChunkIndexManager(KAGIndexManager):
     @property
