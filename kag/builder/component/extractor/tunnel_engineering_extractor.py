@@ -275,7 +275,7 @@ class TunnelEngineeringExtractor(ExtractorABC):
             relations = self._extract_relations_token_aware(content, list(standardized_entities.keys()))
             
             # 4. 构建子图
-            subgraph = self._build_subgraph(standardized_entities, relations)
+            subgraph = self._build_subgraph(standardized_entities, relations, input)
             
             # 5. 更新统计信息
             self._update_extraction_stats(entities, relations)
@@ -677,13 +677,14 @@ class TunnelEngineeringExtractor(ExtractorABC):
             logger.warning(f"响应类型: {type(response)}, 响应内容: {response}")
             return {}
     
-    def _build_subgraph(self, entities: Dict[str, str], relations: List[Dict[str, Any]]) -> SubGraph:
+    def _build_subgraph(self, entities: Dict[str, str], relations: List[Dict[str, Any]], chunk: Chunk) -> SubGraph:
         """
         构建知识子图
         
         Args:
             entities: 标准化后的实体映射
             relations: 抽取的关系列表
+            chunk: 原始chunk信息，用于设置节点的source属性
             
         Returns:
             知识子图
@@ -700,14 +701,25 @@ class TunnelEngineeringExtractor(ExtractorABC):
         logger.info(f"实体集合: {entity_set}")
         
         for entity in entity_set:
+            # 将中文实体名称映射到英文实体类型
+            english_entity_type = self._map_chinese_to_english_entity_type(entity)
+            
+            # 构建节点属性，包含source信息
+            node_properties = {
+                "type": "entity", 
+                "chinese_name": entity,
+                "source_id": getattr(chunk, 'id', 'unknown'),
+                "source_content": getattr(chunk, 'content', '')[:200] if hasattr(chunk, 'content') else ''  # 截取前200字符作为摘要
+            }
+            
             node = Node(
                 _id=entity,
                 name=entity,
-                label=entity,
-                properties={"type": "entity"}
+                label=english_entity_type,  # 使用英文实体类型作为label
+                properties=node_properties
             )
             nodes.append(node)
-            logger.debug(f"创建节点: {entity}")
+            logger.debug(f"创建节点: {entity} -> {english_entity_type}, source_id: {node_properties['source_id']}")
         
         # 构建边
         for relation in relations:
@@ -727,18 +739,308 @@ class TunnelEngineeringExtractor(ExtractorABC):
                         object_node = node
                 
                 if subject_node and object_node:
+                    # 将中文关系名称映射到英文关系名称
+                    english_relation = self._map_chinese_to_english_relation(predicate)
+                    
                     edge = Edge(
-                        _id=f"{subject}_{predicate}_{obj}",
+                        _id=f"{subject}_{english_relation}_{obj}",
                         from_node=subject_node,
                         to_node=object_node,
-                        label=predicate,
-                        properties={"confidence": confidence}
+                        label=english_relation,  # 使用英文关系名称作为label
+                        properties={"confidence": confidence, "chinese_relation": predicate}
                     )
                     edges.append(edge)
+                    logger.debug(f"创建边: {subject} -[{predicate} -> {english_relation}]-> {obj}")
         
-        logger.info(f"构建完成 - 节点数: {len(nodes)}, 边数: {len(edges)}")
+        # 创建SubGraph对象
+        sub_graph = SubGraph(nodes, edges)
+        
+        # 添加Chunk节点并建立实体与Chunk的关系（参考schema_free_extractor.py的实现）
+        self._assemble_sub_graph_with_chunk(sub_graph, chunk)
+        
+        logger.info(f"构建完成 - 节点数: {len(sub_graph.nodes)}, 边数: {len(sub_graph.edges)}")
         logger.info(f"=== 构建子图结束 ===")
-        return SubGraph(nodes, edges)
+        return sub_graph
+    
+    def _assemble_sub_graph_with_chunk(self, sub_graph: SubGraph, chunk: Chunk):
+        """
+        将Chunk信息添加到子图中，为每个实体节点添加指向Chunk的"source"边
+        
+        Args:
+            sub_graph: 要添加Chunk信息的子图
+            chunk: 包含文本和元数据的Chunk对象
+        """
+        from knext.schema.client import CHUNK_TYPE
+        
+        # 为每个现有节点添加指向Chunk的"source"边
+        for node in sub_graph.nodes:
+            sub_graph.add_edge(node.id, node.label, "source", chunk.id, CHUNK_TYPE)
+            logger.debug(f"为节点 {node.name} 添加source边指向chunk {chunk.id}")
+        
+        # 添加Chunk节点到子图中
+        chunk_properties = {
+            "id": chunk.id,
+            "name": getattr(chunk, 'name', chunk.id),
+            "content": f"{getattr(chunk, 'name', chunk.id)}\n{getattr(chunk, 'content', '')}",
+        }
+        
+        # 添加chunk的其他属性（如果有的话）
+        if hasattr(chunk, 'kwargs') and chunk.kwargs:
+            chunk_properties.update(chunk.kwargs)
+        
+        sub_graph.add_node(
+            chunk.id,
+            getattr(chunk, 'name', chunk.id),
+            CHUNK_TYPE,
+            chunk_properties
+        )
+        
+        # 设置子图的ID为chunk的ID
+        sub_graph.id = chunk.id
+        
+        logger.debug(f"添加Chunk节点: {chunk.id}, 类型: {CHUNK_TYPE}")
+    
+    def _map_chinese_to_english_entity_type(self, chinese_entity: str) -> str:
+        """
+        将中文实体名称映射到Schema中定义的英文实体类型
+        
+        Args:
+            chinese_entity: 中文实体名称
+            
+        Returns:
+            对应的英文实体类型名称
+        """
+        try:
+            # 如果有Schema信息，尝试从中查找映射
+            if hasattr(self, 'schema') and self.schema:
+                for english_name, entity_info in self.schema.items():
+                    if isinstance(entity_info, dict):
+                        # 检查中文名称是否匹配
+                        chinese_name = entity_info.get('label', '')
+                        if chinese_name == chinese_entity:
+                            logger.debug(f"找到精确匹配: {chinese_entity} -> {english_name}")
+                            return english_name
+                        
+                        # 检查是否包含关键词
+                        if chinese_entity in chinese_name or chinese_name in chinese_entity:
+                            logger.debug(f"找到部分匹配: {chinese_entity} -> {english_name}")
+                            return english_name
+            
+            # 如果没有找到精确匹配，使用基于规则的映射
+            entity_mapping = self._get_entity_type_mapping()
+            
+            for english_type, chinese_keywords in entity_mapping.items():
+                for keyword in chinese_keywords:
+                    if keyword in chinese_entity or chinese_entity in keyword:
+                        logger.debug(f"基于规则映射: {chinese_entity} -> {english_type}")
+                        return english_type
+            
+            # 如果都没有找到，返回通用实体类型
+            logger.warning(f"无法映射实体类型: {chinese_entity}，使用默认类型")
+            return "Entity"
+            
+        except Exception as e:
+            logger.error(f"实体类型映射失败: {chinese_entity}, 错误: {e}")
+            return "Entity"
+    
+    def _get_entity_type_mapping(self) -> Dict[str, List[str]]:
+        """
+        从Schema中动态获取实体类型映射规则
+        
+        Returns:
+            英文实体类型到中文关键词的映射
+        """
+        entity_mapping = {}
+        
+        # 如果有Schema信息，从中提取实体类型和中文标签
+        if hasattr(self, 'schema') and self.schema:
+            # 正确的schema使用方式：遍历schema中的所有类型
+            try:
+                # schema是一个SchemaClient对象，需要通过正确的方式访问
+                # 根据schema_free_extractor.py的用法，应该通过schema.get(type_name)获取spg_type
+                # 但首先需要获取所有可用的类型名称
+                if hasattr(self.schema, '__iter__'):
+                    for type_name in self.schema:
+                        spg_type = self.schema.get(type_name)
+                        if spg_type is not None:
+                            # 获取类型的中文标签（如果有的话）
+                            chinese_label = getattr(spg_type, 'label', '') or getattr(spg_type, 'name_zh', '') or type_name
+                            
+                            # 将中文标签分解为关键词
+                            keywords = [chinese_label, type_name]  # 包含英文类型名和中文标签
+                            
+                            # 添加一些常见的同义词或相关词
+                            if '隧道' in chinese_label:
+                                keywords.extend(['隧道', '隧道段', '段落', '区段'])
+                            elif '排水' in chinese_label:
+                                keywords.extend(['排水', '排水井', '沉沙井', '检查井'])
+                            elif '防水' in chinese_label:
+                                keywords.extend(['防水', '防水板', '防水层', '防水材料'])
+                            elif '止水' in chinese_label:
+                                keywords.extend(['止水', '止水条', '止水带'])
+                            elif '处理' in chinese_label:
+                                keywords.extend(['处理', '处理方法', '施工方法', '工艺', '技术'])
+                            elif '安全' in chinese_label or '奖惩' in chinese_label:
+                                keywords.extend(['安全', '制度', '奖惩', '管理制度'])
+                            elif '物资' in chinese_label or '材料' in chinese_label:
+                                keywords.extend(['物资', '材料', '设备'])
+                            elif '缝' in chinese_label:
+                                keywords.extend(['缝', '施工缝', '沉降缝', '伸缩缝'])
+                            
+                            entity_mapping[type_name] = list(set(keywords))
+            except Exception as e:
+                logger.warning(f"从Schema中提取实体类型映射失败: {e}")
+        
+        # 如果Schema为空或没有足够信息，使用基础映射作为后备
+        if not entity_mapping:
+            entity_mapping = {
+                "Entity": ["实体", "对象", "物体"],  # 通用实体类型
+                "Material": ["材料", "物质", "物资"],
+                "Equipment": ["设备", "机械", "工具"],
+                "Method": ["方法", "工艺", "技术"],
+                "System": ["系统", "制度", "体系"]
+            }
+        
+        return entity_mapping
+    
+    def _map_chinese_to_english_relation(self, chinese_relation: str) -> str:
+        """
+        将中文关系名称映射到Schema中定义的英文关系名称
+        
+        Args:
+            chinese_relation: 中文关系名称（可能包含命名空间前缀）
+            
+        Returns:
+            对应的英文关系名称
+        """
+        try:
+            # 处理带命名空间的关系名称，如 'appliedTo_Tunnelknowledge.Hazard'
+            base_relation = chinese_relation
+            if '_' in chinese_relation:
+                # 提取基础关系名称（下划线前的部分）
+                base_relation = chinese_relation.split('_')[0]
+                logger.debug(f"提取基础关系名称: {chinese_relation} -> {base_relation}")
+            
+            # 如果有Schema信息，尝试从中查找映射
+            if hasattr(self, 'schema') and self.schema:
+                try:
+                    # 正确的schema使用方式：遍历schema中的所有类型
+                    if hasattr(self.schema, '__iter__'):
+                        for type_name in self.schema:
+                            spg_type = self.schema.get(type_name)
+                            if spg_type is not None and hasattr(spg_type, 'properties'):
+                                # 遍历该类型的所有属性（包括关系）
+                                for prop_name, prop in spg_type.properties.items():
+                                    # 检查是否是关系属性（非基础类型）
+                                    if hasattr(prop, 'object_type_name_en'):
+                                        from knext.schema.client import BASIC_TYPES
+                                        if prop.object_type_name_en not in BASIC_TYPES:
+                                            # 检查是否有关系名称的映射
+                                            if base_relation == prop_name or chinese_relation == prop_name:
+                                                return prop_name
+                except Exception as e:
+                    logger.warning(f"从Schema中查找关系映射失败: {e}")
+            
+            # 使用基于规则的映射
+            relation_mapping = self._get_relation_type_mapping()
+            
+            # 首先尝试精确匹配基础关系名称
+            if base_relation in relation_mapping:
+                logger.debug(f"关系映射: {chinese_relation} -> {base_relation}")
+                return base_relation
+            
+            # 然后尝试关键词匹配
+            for english_relation, chinese_keywords in relation_mapping.items():
+                for keyword in chinese_keywords:
+                    if keyword in base_relation or base_relation in keyword:
+                        logger.debug(f"关系映射: {chinese_relation} -> {english_relation}")
+                        return english_relation
+            
+            # 如果都没有找到，返回基础关系名称（去掉命名空间）
+            logger.warning(f"无法映射关系类型: {chinese_relation}，使用基础名称: {base_relation}")
+            return base_relation
+            
+        except Exception as e:
+            logger.error(f"关系类型映射失败: {chinese_relation}, 错误: {e}")
+            return chinese_relation
+    
+    def _get_relation_type_mapping(self) -> Dict[str, List[str]]:
+        """
+        从Schema中动态获取关系类型映射规则
+        
+        Returns:
+            英文关系类型到中文关键词的映射
+        """
+        relation_mapping = {}
+        
+        # 如果有Schema信息，从中提取关系类型和中文标签
+        if hasattr(self, 'schema') and self.schema:
+            try:
+                # 正确的schema使用方式：遍历schema中的所有类型
+                if hasattr(self.schema, '__iter__'):
+                    for type_name in self.schema:
+                        spg_type = self.schema.get(type_name)
+                        if spg_type is not None and hasattr(spg_type, 'properties'):
+                            # 遍历该类型的所有属性（包括关系）
+                            for prop_name, prop in spg_type.properties.items():
+                                # 检查是否是关系属性（非基础类型）
+                                if hasattr(prop, 'object_type_name_en'):
+                                    from knext.schema.client import BASIC_TYPES
+                                    if prop.object_type_name_en not in BASIC_TYPES:
+                                        # 这是一个关系属性
+                                        english_relation = prop_name
+                                        
+                                        # 基于英文关系名称生成中文关键词
+                                        keywords = []
+                                        if english_relation == 'contains':
+                                            keywords = ["包含", "含有", "包括"]
+                                        elif english_relation == 'partOf':
+                                            keywords = ["属于", "组成", "部分"]
+                                        elif english_relation == 'locatedIn':
+                                            keywords = ["位于", "在", "处于"]
+                                        elif english_relation == 'installedIn':
+                                            keywords = ["安装于", "安装在", "设置在"]
+                                        elif english_relation == 'connectedTo':
+                                            keywords = ["连接至", "连接到", "连通"]
+                                        elif english_relation == 'usedIn':
+                                            keywords = ["用于", "使用于", "应用于"]
+                                        elif english_relation == 'appliedTo':
+                                            keywords = ["应用于", "适用于", "施用于"]
+                                        elif english_relation == 'appliesTo':
+                                            keywords = ["适用于", "应用于"]
+                                        elif english_relation == 'involves':
+                                            keywords = ["涉及", "包括", "涉及到"]
+                                        elif english_relation == 'protectedBy':
+                                            keywords = ["被保护", "保护", "防护"]
+                                        elif english_relation == 'equippedWith':
+                                            keywords = ["配备", "装备", "设有"]
+                                        elif english_relation == 'prohibits':
+                                            keywords = ["禁止", "不允许", "严禁"]
+                                        elif english_relation == 'requires':
+                                            keywords = ["需要", "要求", "必须"]
+                                        elif english_relation == 'ensures':
+                                            keywords = ["确保", "保证", "保障"]
+                                        elif english_relation == 'meets':
+                                            keywords = ["满足", "达到", "符合"]
+                                        else:
+                                            # 对于其他关系，使用通用映射
+                                            keywords = ["相关", "关联"]
+                                        
+                                        if keywords:
+                                            relation_mapping[english_relation] = keywords
+            except Exception as e:
+                logger.warning(f"从Schema中提取关系类型映射失败: {e}")
+        
+        # 如果Schema为空或没有足够信息，使用基础映射作为后备
+        if not relation_mapping:
+            relation_mapping = {
+                "relatedTo": ["相关", "关联", "有关"],
+                "contains": ["包含", "含有", "包括"],
+                "partOf": ["属于", "组成", "部分"],
+                "usedIn": ["用于", "使用于", "应用于"]
+            }
+        
+        return relation_mapping
     
     def _update_extraction_stats(self, entities: Dict[str, List[str]], relations: List[Dict[str, Any]]):
         """
